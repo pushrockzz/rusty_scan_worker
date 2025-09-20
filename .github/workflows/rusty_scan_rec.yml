@@ -1,1 +1,119 @@
+name: RustScan Worker - Secondary
 
+on:
+  workflow_dispatch:
+    inputs:
+      primary_repo_owner:
+        description: 'The owner of the primary repository.'
+        required: true
+      primary_repo_name:
+        description: 'The name of the primary repository.'
+        required: true
+      primary_run_id:
+        description: 'The run ID of the primary workflow.'
+        required: true
+      chunk_package_artifact_name:
+        description: 'The name of the artifact package containing all scan data.'
+        required: true
+      secondary_matrix_json:
+        description: 'The JSON string for the matrix of IP chunks for this worker.'
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  process_assigned_chunks_secondary_worker:
+    name: Process Assigned Scan Chunks (Secondary)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/pcoder7/spider-puredns-actions:latest
+      credentials:
+        username: ${{ secrets.GHCR_USER }} # Assumes you have these secrets in the worker repo
+        password: ${{ secrets.GHCR_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: ${{ fromJson(github.event.inputs.secondary_matrix_json) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Scan Package from Primary Account
+        env:
+          GH_TOKEN: ${{ secrets.PAT_FOR_PRIMARY_ACCOUNT_ARTIFACTS_READ }}
+          PRIMARY_REPO: ${{ github.event.inputs.primary_repo_owner }}/${{ github.event.inputs.primary_repo_name }}
+          PRIMARY_RUN_ID: ${{ github.event.inputs.primary_run_id }}
+          ARTIFACT_NAME: ${{ github.event.inputs.chunk_package_artifact_name }}
+        run: |
+          echo "WORKER: Downloading artifact '$ARTIFACT_NAME' from $PRIMARY_REPO..."
+          gh run download "$PRIMARY_RUN_ID" -R "$PRIMARY_REPO" -n "$ARTIFACT_NAME" --dir .
+      
+      - name: Extract Scan Package Archive
+        run: |
+          if [ -f *.tar.gz ]; then
+            tar -xzvf *.tar.gz
+            echo "✅ Successfully extracted chunks and mapping file."
+          else
+            echo "::error:: Scan package not found! Failed to download from primary."; exit 0
+          fi
+
+      - name: Map Subdomains to Ports (Naabu + RustScan)
+        run: |
+          # This logic is identical to the primary workflow's scanning step.
+          IP_CHUNK_FILE="${{ matrix.pair.chunk }}"; FULL_MASSDNS_FILE="all_massdns_records.txt"; OUTPUT="subdomain_ports.txt"; PORTS="80,443,8080,8443,3000,8000"
+          TMP_IP2SUB=$(mktemp); TMP_NONCDN=$(mktemp); TMP_CDN=$(mktemp); TMP_SMAP_NONCDN=$(mktemp); TMP_RUSTSCAN=$(mktemp); SMAP_FILE=$(mktemp)
+          awk '{ print $3, $1 }' "$FULL_MASSDNS_FILE" | sort -k1,1 -u > "$TMP_IP2SUB"
+          cat "$IP_CHUNK_FILE" | cut-cdn -ua -t 50 -silent -o "$TMP_NONCDN" || true
+          if [ -s "$TMP_NONCDN" ]; then
+              naabu -l "$TMP_NONCDN" -passive -o "$TMP_SMAP_NONCDN" -no-color -silent || true
+              rustscan -a "$TMP_NONCDN" -p "$PORTS" --no-banner -t 4000 --tries 1 -u 5000 -b 600 --greppable --accessible > "$TMP_RUSTSCAN" || true
+              cat "$TMP_RUSTSCAN" | awk -F ' -> ' '{ gsub(/[\[\]]/, "", $2); n = split($2, p, ","); for(i=1;i<=n;i++) print $1 ":" p[i] }' | anew -q "$TMP_SMAP_NONCDN" || true
+          fi
+          cat "$IP_CHUNK_FILE" | anew -d "$TMP_NONCDN" > "$TMP_CDN"
+          cat "$TMP_SMAP_NONCDN" "$TMP_CDN" 2>/dev/null | sort -u > "$SMAP_FILE"
+          awk -F: '
+            NF==2 { print $1, $2 }    # IP:PORT → IP PORT
+            NF==1 { print $1, ""  }   # bare IP → IP <empty>
+          ' "$SMAP_FILE" \
+            | sort -k1,1 \
+            | join - "$TMP_IP2SUB" \
+            | { 
+              awk '
+                # This guard clause ignores blank or malformed lines from the input.
+                NF >= 2 { 
+                  # Check if the line has 3 fields AND the second field contains only digits.
+                  # This is a more robust check than simply seeing if the field is not empty.
+                  # The regex /^[0-9]+$/ ensures field 2 is a valid port number.
+                  if (NF == 3 && $2 ~ /^[0-9]+$/) { 
+                    # If it has a port, print in SUBDOMAIN:PORT format.
+                    print $3 ":" $2 
+                  } else { 
+                    # Otherwise, print just the subdomain. The last field ($NF) is the most
+                    # reliable way to get the subdomain, as it works for both 2- and 3-field inputs.
+                    print $NF 
+                  } 
+                }
+              '       
+            } \
+            > "$OUTPUT"
+            
+          echo "✅ Generated $OUTPUT (first 5 lines):"
+          head -n50 "$OUTPUT"
+          # cleanup
+          rm -f "$TMP_IP2SUB" "$TMP_IP_ONLY" "$TMP_NONCDN" "$TMP_CDN" "$TMP_SMAP_NONCDN" "$TMP_RUSTSCAN"               
+
+      - name: Sort Port Scan Results
+        run: |
+          mkdir -p results; if [ ! -s "subdomain_ports.txt" ]; then exit 0; fi
+          while read -r line; do subdomain=$(echo "$line" | cut -d: -f1); parent=$(echo "$subdomain" | rev | cut -d. -f1,2 | rev); mkdir -p "results/$parent"; echo "$line" >> "results/$parent/subdomain_ports.txt"; done < subdomain_ports.txt
+      
+      - name: Compute SAFE_CHUNK (no slashes)
+        run: |
+          SAFE_CHUNK="${{ matrix.pair.chunk }}"; SAFE_CHUNK="$(echo "$SAFE_CHUNK" | tr '/' '_')"; echo "SAFE_CHUNK=$SAFE_CHUNK" >> $GITHUB_ENV
+      
+      - name: Upload Secondary Account Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustscan-results-secondary-${{ env.SAFE_CHUNK }}
+          path: results/
+          retention-days: 1
