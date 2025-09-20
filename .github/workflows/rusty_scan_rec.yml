@@ -57,63 +57,100 @@ jobs:
             echo "::error:: Scan package not found! Failed to download from primary."; exit 0
           fi
 
+
       - name: Map Subdomains to Ports (Naabu + RustScan)
+        id: map_subdomains_cdn
         run: |
-          # This logic is identical to the primary workflow's scanning step.
-          IP_CHUNK_FILE="${{ matrix.pair.chunk }}"; FULL_MASSDNS_FILE="all_massdns_records.txt"; OUTPUT="subdomain_ports.txt"; PORTS="80,443,8080,8443,3000,8000"
-          TMP_IP2SUB=$(mktemp); TMP_NONCDN=$(mktemp); TMP_CDN=$(mktemp); TMP_SMAP_NONCDN=$(mktemp); TMP_RUSTSCAN=$(mktemp); SMAP_FILE=$(mktemp)
+          IP_CHUNK_FILE="${{ matrix.pair.chunk }}"
+          FULL_MASSDNS_FILE="all_massdns_records.txt"
+          OUTPUT="subdomain_ports.txt"
+          PORTS="80,443,8080,8443,3000,8000"
+          # Create per-runner temp files
+          TMP_IP2SUB=$(mktemp)
+          TMP_NONCDN=$(mktemp)
+          TMP_CDN=$(mktemp)
+          TMP_SMAP_NONCDN=$(mktemp)
+          TMP_RUSTSCAN=$(mktemp)
+          SMAP_FILE=$(mktemp)
+          
+          echo "▶ Cleaning & extracting A-records from FULL mapping file..."
           awk '{ print $3, $1 }' "$FULL_MASSDNS_FILE" | sort -k1,1 -u > "$TMP_IP2SUB"
+          echo "✅ Master lookup table created with $(wc -l < $TMP_IP2SUB) entries."
+          
+          echo "▶ Filtering non-CDN IPs for this chunk with cut-cdn..."
           cat "$IP_CHUNK_FILE" | cut-cdn -ua -t 50 -silent -o "$TMP_NONCDN" || true
-          if [ -s "$TMP_NONCDN" ]; then
+          echo "✅ All done. TMP_NONCDN (for this chunk) contains $(wc -l < "$TMP_NONCDN") IPs."
+          head -n5 "$TMP_NONCDN"
+          echo "==================================================================="
+          if [ ! -s "$TMP_NONCDN" ]; then
+              echo "::notice:: No non-CDN IPs in this chunk. Skipping scans."
+          else
+              echo "▶ Running naabu (passive) on non-CDN IPs..."
               naabu -l "$TMP_NONCDN" -passive -o "$TMP_SMAP_NONCDN" -no-color -silent || true
+              
+              echo "▶ Running rustscan (active) on non-CDN IPs..."
               rustscan -a "$TMP_NONCDN" -p "$PORTS" --no-banner -t 4000 --tries 1 -u 5000 -b 600 --greppable --accessible > "$TMP_RUSTSCAN" || true
+              
+              echo "▶ Merging rustscan results into naabu results..."
               cat "$TMP_RUSTSCAN" | awk -F ' -> ' '{ gsub(/[\[\]]/, "", $2); n = split($2, p, ","); for(i=1;i<=n;i++) print $1 ":" p[i] }' | anew -q "$TMP_SMAP_NONCDN" || true
+              echo "✅ All done. TMP_SMAP_NONCDN contains $(wc -l < "$TMP_SMAP_NONCDN") IP:Port combos."
+              head -n20 "$TMP_SMAP_NONCDN"
+              echo "==================================================================="
           fi
+          echo "▶ Deriving CDN IP list for this chunk..."
           cat "$IP_CHUNK_FILE" | anew -d "$TMP_NONCDN" > "$TMP_CDN"
+          echo "✅ All done. TMP_CDN contains $(wc -l < "$TMP_CDN") IPs."
+          head -n5 "$TMP_CDN"
+          echo "==================================================================="
+          
+          echo "▶ Merging scanned non-CDN results with bare CDN IPs..."
           cat "$TMP_SMAP_NONCDN" "$TMP_CDN" 2>/dev/null | sort -u > "$SMAP_FILE"
+          echo "✅ All done. SMAP_FILE contains $(wc -l < "$SMAP_FILE") total entries."
+          head -n20 "$SMAP_FILE"
+          echo "==================================================================="
+          echo "▶ Joining with lookup table to produce final subdomain:port file..."
           awk -F: '
-            NF==2 { print $1, $2 }    # IP:PORT → IP PORT
-            NF==1 { print $1, ""  }   # bare IP → IP <empty>
+            NF==2 { print $1, $2 }
+            NF==1 { print $1, ""  }
           ' "$SMAP_FILE" \
             | sort -k1,1 \
             | join - "$TMP_IP2SUB" \
             | { 
               awk '
-                # This guard clause ignores blank or malformed lines from the input.
                 NF >= 2 { 
-                  # Check if the line has 3 fields AND the second field contains only digits.
-                  # This is a more robust check than simply seeing if the field is not empty.
-                  # The regex /^[0-9]+$/ ensures field 2 is a valid port number.
                   if (NF == 3 && $2 ~ /^[0-9]+$/) { 
-                    # If it has a port, print in SUBDOMAIN:PORT format.
                     print $3 ":" $2 
                   } else { 
-                    # Otherwise, print just the subdomain. The last field ($NF) is the most
-                    # reliable way to get the subdomain, as it works for both 2- and 3-field inputs.
                     print $NF 
                   } 
                 }
               '       
             } \
             > "$OUTPUT"
-            
-          echo "✅ Generated $OUTPUT (first 5 lines):"
+          
+          echo "✅ Generated $OUTPUT for this chunk:"
           head -n50 "$OUTPUT"
-          # cleanup
-          rm -f "$TMP_IP2SUB" "$TMP_IP_ONLY" "$TMP_NONCDN" "$TMP_CDN" "$TMP_SMAP_NONCDN" "$TMP_RUSTSCAN"               
+          
+          # Cleanup
+          rm -f "$TMP_IP2SUB" "$TMP_NONCDN" "$TMP_CDN" "$TMP_SMAP_NONCDN" "$TMP_RUSTSCAN" "$SMAP_FILE"
 
       - name: Sort Port Scan Results
         run: |
           mkdir -p results; if [ ! -s "subdomain_ports.txt" ]; then exit 0; fi
           while read -r line; do subdomain=$(echo "$line" | cut -d: -f1); parent=$(echo "$subdomain" | rev | cut -d. -f1,2 | rev); mkdir -p "results/$parent"; echo "$line" >> "results/$parent/subdomain_ports.txt"; done < subdomain_ports.txt
       
+      # FIX: This new step creates the safe artifact name.
       - name: Compute SAFE_CHUNK (no slashes)
         run: |
-          SAFE_CHUNK="${{ matrix.pair.chunk }}"; SAFE_CHUNK="$(echo "$SAFE_CHUNK" | tr '/' '_')"; echo "SAFE_CHUNK=$SAFE_CHUNK" >> $GITHUB_ENV
+          SAFE_CHUNK="${{ matrix.pair.chunk }}"
+          SAFE_CHUNK="$(echo "$SAFE_CHUNK" | tr '/' '_')"
+          echo "SAFE_CHUNK=$SAFE_CHUNK" >> $GITHUB_ENV
       
-      - name: Upload Secondary Account Scan Results
+      # FIX: This step now uses the safe environment variable.
+      - name: Upload Primary Account Scan Results
         uses: actions/upload-artifact@v4
         with:
-          name: rustscan-results-secondary-${{ env.SAFE_CHUNK }}
+          name: rustscan-results-primary-${{ env.SAFE_CHUNK }}
           path: results/
           retention-days: 1
+         
