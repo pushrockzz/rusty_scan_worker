@@ -57,7 +57,6 @@ jobs:
             echo "::error:: Scan package not found! Failed to download from primary."; exit 0
           fi
 
-
       - name: Map Subdomains to Ports (Naabu + RustScan)
         id: map_subdomains_cdn
         run: |
@@ -139,18 +138,182 @@ jobs:
           mkdir -p results; if [ ! -s "subdomain_ports.txt" ]; then exit 0; fi
           while read -r line; do subdomain=$(echo "$line" | cut -d: -f1); parent=$(echo "$subdomain" | rev | cut -d. -f1,2 | rev); mkdir -p "results/$parent"; echo "$line" >> "results/$parent/subdomain_ports.txt"; done < subdomain_ports.txt
       
-      # FIX: This new step creates the safe artifact name.
       - name: Compute SAFE_CHUNK (no slashes)
         run: |
           SAFE_CHUNK="${{ matrix.pair.chunk }}"
           SAFE_CHUNK="$(echo "$SAFE_CHUNK" | tr '/' '_')"
           echo "SAFE_CHUNK=$SAFE_CHUNK" >> $GITHUB_ENV
-      
-      # FIX: This step now uses the safe environment variable.
+    
       - name: Upload Primary Account Scan Results
         uses: actions/upload-artifact@v4
         with:
           name: rustscan-results-primary-${{ env.SAFE_CHUNK }}
           path: results/
           retention-days: 1
-         
+
+  merge_results:
+    name: Merge All Distributed Scan Results
+    needs: process_assigned_chunks_secondary_worker
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      has_results: ${{ steps.consolidate.outputs.has_results }}
+    steps:
+      - name: Download all result artifacts from all accounts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'rustscan-results-*'
+          path: temp-aggregated-results
+          merge-multiple: true
+          
+      - name: Check if artifacts were downloaded
+        id: check_artifacts
+        run: |
+          if [ -d "temp-aggregated-results" ] && [ -n "$(ls -A temp-aggregated-results)" ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Consolidate all scan results
+        id: consolidate
+        if: steps.check_artifacts.outputs.found == 'true'
+        run: |
+          mkdir -p final_results
+          find temp-aggregated-results -type f -name "subdomain_ports.txt" | while read -r f; do D=$(basename "$(dirname "$f")"); mkdir -p "final_results/$D"; cat "$f" >> "final_results/$D/subdomain_ports.txt"; done
+          find final_results -type f -name "*.txt" -exec sort -u -o {} {} \;
+          if [ -z "$(ls -A final_results)" ]; then
+            echo "::warning:: Result artifacts were downloaded, but they contained no valid data."
+            echo "has_results=false" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Successfully consolidated results from all accounts."
+            echo "has_results=true" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Upload Final Consolidated Artifact
+        if: steps.consolidate.outputs.has_results == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: consolidated-scan-results
+          path: final_results/
+          retention-days: 1
+
+  
+  commit_all_results:
+    name: Commit Scan Results & Notify
+    needs: merge_results
+    if: always() && needs.merge_results.outputs.has_results == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download the single consolidated results artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: consolidated-scan-results
+          path: final_results
+          
+      - name: Organize and Push Port Results
+        env:
+          STORE_RECON_PAT: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
+          ACCOUNT2_USERNAME: ${{ secrets.ACCOUNT2_REPO_OWNER }}
+          STORE: ${{ secrets.STORE }}
+          CORRELATION_ID: ${{ github.event.inputs.primary_run_id }}
+        run: |
+          RESULTS_DIR="${GITHUB_WORKSPACE}/final_results"
+          
+          if [ ! -d "$RESULTS_DIR" ] || [ -z "$(ls -A "$RESULTS_DIR")" ]; then
+            echo "::warning:: Results directory is empty or does not exist. Nothing to commit."
+            exit 0
+          fi
+          
+          echo "Cloning ${STORE} to commit results..."
+          git config --global user.name "Assetfinder Bot"
+          git config --global user.email "actions-bot@users.noreply.github.com"
+          
+          TMP_DIR="$(mktemp -d)"
+          if ! git clone "https://x-access-token:${STORE_RECON_PAT}@github.com/${ACCOUNT2_USERNAME}/${STORE}.git" "$TMP_DIR"; then
+            echo "::error:: Failed to clone the repository. Aborting the commit process."
+            exit 0 # Exit successfully as requested
+          fi
+          cd "$TMP_DIR" 
+          
+          # --- Reusable function to merge artifact data ---
+          run_merge() {
+          
+            echo "Merging new consolidated results into the repository..."
+            
+            for domain_dir in "${RESULTS_DIR}"/*; do
+              if [ ! -d "$domain_dir" ]; then continue; fi
+              domain_name=$(basename "$domain_dir")
+              dest_repo_dir="results/$domain_name"
+              mkdir -p "$dest_repo_dir"           
+             
+              source_ports_file="$domain_dir/subdomain_ports.txt"
+              dest_puredns_file="$dest_repo_dir/puredns_result.txt"
+              if [ -s "$source_ports_file" ]; then
+                <"$source_ports_file" tr -d '\0' \
+                  | grep '[[:alnum:]]' \
+                  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+                  | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g" \
+                  > "$source_ports_file.tmp" && mv "$source_ports_file.tmp" "$source_ports_file"
+                echo "  -> Merging port data into '$dest_puredns_file'"
+                temp_merged_file_2=$(mktemp)
+                if [ -f "$dest_puredns_file" ]; then cat "$source_ports_file" "$dest_puredns_file" | sort -u > "$temp_merged_file_2"; else sort -u "$source_ports_file" > "$temp_merged_file_2"; fi
+                mv "$temp_merged_file_2" "$dest_puredns_file"
+              fi
+            done
+            
+            # Stage all changes within the results directory
+            git add results/
+          }
+          run_merge
+          if git diff --cached --quiet; then
+            echo "No new unique data to commit in ${STORE}."
+            exit 0
+          fi
+          
+          # 2. Commit the changes locally
+          echo "Committing changes locally..."
+          git commit -m "feat: Rustyy scan results from Correlation ID: ${CORRELATION_ID}"
+          
+          # 3. Loop to sync and push the commit, with a robust retry mechanism
+          MAX_ATTEMPTS=10
+          for (( i=1; i<=MAX_ATTEMPTS; i++ )); do
+            echo "[Attempt $i/$MAX_ATTEMPTS] Pushing changes..."
+            
+            # Optimistic push first
+            if git push -v origin main; then
+              echo "✅ Successfully pushed new consolidated results to ${STORE} on attempt $i."
+              exit 0
+            fi
+            
+            echo "::warning:: Push failed on attempt $i. Fetching latest changes from remote and re-applying local changes."
+            
+            # If push failed, fetch the latest state from the remote
+            git fetch origin main
+            if [ $? -ne 0 ]; then
+                echo "::error:: Git fetch failed. Cannot safely retry."
+                sleep $(( 5 * i ))
+                continue # Try again
+            fi
+            
+            # Reset local state to match remote, discarding the old local commit
+            git reset --hard origin/main
+            
+            # Re-run the merge logic on top of the fresh, updated branch
+            echo "Re-applying merge logic on top of the updated main branch..."
+            run_merge
+            
+            # Check if there are still changes to commit after the re-merge
+            if git diff --cached --quiet; then
+              echo "No net new changes to commit after syncing with remote. Another run may have already pushed these results."
+              exit 0
+            fi
+            
+            # Re-commit the newly calculated changes
+            echo "Re-committing changes for retry attempt..."
+            git commit -m "feat: Add Rusty scan results from Correlation ID: ${CORRELATION_ID} "
+            sleep $(( 5 * i ))
+          done
+          echo "::error:: All $MAX_ATTEMPTS push attempts failed. The job will pass but the commit was NOT pushed."
+          exit 0     
